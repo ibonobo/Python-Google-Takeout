@@ -1,0 +1,109 @@
+#!/usr/bin/env python
+  
+# Author: Tashfeen Bhimdi
+# Version: 2014-07-28
+#
+# Modification of code by John Baab (googlecontacts.py v0.1)
+# http://pbxinaflash.com/community/index.php?threads/google-contacts-to-asterisk-phonebook.10943/
+#
+# Purpose: Downloads contacts from Google to a Callcentric Phone Book CSV file
+# Requirements: python, gdata python module
+# Notes: This is READ-ONLY from Google script:
+#        -Contacts are pulled from Google
+#        -Pulled contacts are stored in a CSV file
+#
+# Debian:
+# apt-get install python-gdata
+#
+# License:
+#
+# This Package is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation; either
+# version 3 of the License, or (at your option) any later version.
+#
+# This package is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public
+# License along with this package; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# On Debian & Ubuntu systems, a complete copy of the GPL can be found under
+# /usr/share/common-licenses/GPL-3, or (at your option) any later version
+  
+import re
+  
+import gdata.contacts.client
+  
+def Drive():
+  
+    # Use "" if you don't want a prefix removed
+    countryCode = ""
+    internationalDialingCode = "011"
+  
+    # Google login info
+    # PLEASE use app specific passwords
+    # If only using one account, make sure variable is stored in this format:
+    # googleUserAccounts = (("name@example.com", "mypassword"))
+    googleUserAccounts = (("name1@example.com", "pw1"),
+                          ("name2@example.com", "pw2"))
+  
+    csvFileName = "callcentric_whitelist.csv"
+  
+    ################################
+  
+    rx = re.compile('\W+')
+    allGoogleContacts = []
+    for email, password in googleUserAccounts:
+  
+        # Login to Google
+        gd_client = gdata.contacts.client.ContactsClient(source='googlecontacts_callcentric_csv')
+        gd_client.ClientLogin(email, password, gd_client.source)
+     
+        # Retrieve contacts
+        query = gdata.contacts.client.ContactsQuery()
+        query.max_results = 10000
+        feed = gd_client.GetContacts(q = query)
+     
+        for entry in feed.entry:
+     
+            # If contact has a name
+            # If contact has a phone number
+            # If contact is part of a group ("Other Contacts" autogroup is skipped this way)
+            if entry.name is not None and len(entry.phone_number) > 0 and len(entry.group_membership_info) > 0:
+     
+                # Clean up characters in contact name; replace all non-alphanumerics with spaces
+                fullName = entry.name.full_name.text
+                fullName = rx.sub(' ', fullName).strip()
+     
+                for rawPhoneNumber in entry.phone_number:
+                     
+                    # Remove non-numeric characters from the phone number
+                    phoneNumber = re.sub("[^0-9]", "", rawPhoneNumber.text)
+     
+                    # Remove country code from the phone number
+                    if countryCode != "" and phoneNumber.startswith(countryCode):
+                        phoneNumber = phoneNumber[len(countryCode):]
+     
+                    # Remove international dialing code from the phone number
+                    if internationalDialingCode != "" and phoneNumber.startswith(internationalDialingCode):
+                        phoneNumber = phoneNumber[len(internationalDialingCode):]
+     
+                    # Save contact for later insert
+                    allGoogleContacts.append((fullName, phoneNumber))
+  
+    # Remove NAME+NUMBER duplicates (if an account has duplicates or multiple accounts have the same contact)
+    allGoogleContacts = tuple(set(allGoogleContacts))
+  
+    csvFile = open(csvFileName, "w")
+    for csvFullName, csvPhoneNumber in allGoogleContacts:
+        line = ",\"%s\",%s,Whitelist\n" % (csvFullName, csvPhoneNumber)
+        csvFile.write(line)
+     
+    csvFile.close()
+  
+if __name__ == "__main__":
+    Drive()
