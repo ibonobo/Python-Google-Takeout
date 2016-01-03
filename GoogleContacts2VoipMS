@@ -1,0 +1,351 @@
+#!/usr/bin/env python
+  
+# Author: Tashfeen Bhimdi
+# Version: 2015-07-05
+#
+# Purpose: Downloads contacts from Google and adds to Voip.ms's Caller ID Filtering
+#          Also exports Google Contacts to a CSV file for Voip.ms Phonebook import (optional)
+# Notes: This is READ-ONLY from Google and READ+WRITE to Voip.ms script:
+#        -Contacts are pulled from Google
+#        --All groups except "Other Contacts"
+#        --Blacklist group for blacklist numbers
+#        -Pulled contacts are stored in a CSV file for Voip.ms manual phonebook import
+#        -All Voip.ms Caller ID filterings are DELETED
+#        -Voip.ms Caller ID filtering for each DID+GoogleContact is created
+#
+# Ubuntu:
+# apt-get install python-gdata
+# apt-get install python-requests
+# apt-get install python-oauth2client
+#
+# Windows (Python Portable 2.7):
+# App\Scripts\easy_install.exe gdata
+# App\Scripts\easy_install.exe requests
+# App\Scripts\easy_install.exe oauth2client
+#
+# License:
+#
+# This Package is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation; either
+# version 3 of the License, or (at your option) any later version.
+#
+# This package is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public
+# License along with this package; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+#
+# On Debian & Ubuntu systems, a complete copy of the GPL can be found under
+# /usr/share/common-licenses/GPL-3, or (at your option) any later version
+  
+import os
+import re
+import sys
+  
+import gdata.contacts.client
+import requests
+import oauth2client.client
+  
+# GLOBAL VARS
+  
+# Change if modifying script
+gdataSource = "googlecontacts_voipms_rest"
+  
+# From https://developers.google.com/api-client-library/python/auth/service-accounts
+  
+# Go here: https://console.developers.google.com/
+# Under APIs & Auth -> APIs: Add Contacts API
+# Under APIs & Auth -> Credentials: "Create new Client ID"
+# "Service account", "P12 Key"
+# Copy P12 key into credentials subdirectory
+# (I used the same P12 Key for all accounts)
+  
+# If using Google Apps, also do this:
+# Go here: http://admin.google.com/
+# Security -> More Controls -> Advanced Settings -> Authentication -> Manage API client access
+# Client name: "Client ID" from above
+# Scope: https://www.googleapis.com/auth/contacts.readonly
+# Authorize
+# (I used the same Client ID for all accounts)
+  
+# For single account:
+# googleUserAccounts = (("person1@gmail.com", "xxxx.p12", "yyyy@zzzz"),)
+  
+googleUserAccounts = (("person1@gmail.com", "xxxx.p12", "yyyy@zzzz"),
+                      ("person2@gmail.com", "xxxx.p12", "yyyy@zzzz"))
+  
+# All non-numeric characters are removed from all phone numbers
+# Use "" if you don't want a prefix removed
+countryCode = "1"
+internationalDialingCode = "011"
+  
+# Voip.ms CSV file (for import into Voip.ms Phonebook - optional)
+csvFileName = "voipms_phonebook.csv"
+  
+# Voip.ms API info (make sure to enable API and set your IP address in Voip.ms settings)
+voipMsApiPayload = {"api_username" : "name3@example.com",
+                    "api_password" : "ccc"}
+voipMsRestUrl = "https://voip.ms/api/v1/rest.php"
+  
+# (Voip.ms DID, Whitelist Routing, Whitelist Header Name, F-Unreachable, F-Busy, F-No Answer)
+#
+# Currently only the following routings are supported in this script:
+#     account, timecondition, ring_group (untested), forwarding (untested)
+#
+# If using more than one DID, make sure variables are stored in this format:
+#voipMsDids = (("5550001111","timecondition","Work Week",None,None,None),
+#              ("5550002222","ring_group","Home Cell",("ring_group","Home Cell"),None,None))
+#
+# Or for ALL DIDs
+#voipMsDids = (("all","ring_group","Home Cell",None,None,None),)
+voipMsDids = (("5550001234","account","123456_sub",("ring_group","Home Landline"),None,None),)
+  
+# Create a Caller ID Filter that blocks all Anonymous calls
+# Set to False if you don't want to block Anonymous calls
+voipMsAnonymousCallerIDFilter = True
+  
+def Drive():
+    googleContacts = getGoogleContacts()
+    googleContactsToVoipMsCSV(googleContacts)
+    deleteAllVoipMsCallerIDFiltering()
+  
+    # Set all caller id filters
+    if voipMsAnonymousCallerIDFilter == True:
+        setAnonymousCallerIDTimeCondition()
+    googleContactsToVoipMsCallerIDFiltering(googleContacts)
+  
+def getGoogleContacts():
+  
+    rx = re.compile('\W+')
+    googleContactsDict = {}
+    for userEmail, p12Filename, clientEmail in googleUserAccounts:
+  
+        # Login to Google
+        scope = "https://www.googleapis.com/auth/contacts.readonly"
+        with open(os.path.join("./credentials", p12Filename)) as f:
+            private_key = f.read()
+        credentials = oauth2client.client.SignedJwtAssertionCredentials(service_account_name = clientEmail,
+                                                                        private_key = private_key,
+                                                                        scope = scope,
+                                                                        sub = userEmail)
+        auth2token = gdata.gauth.OAuth2TokenFromCredentials(credentials)
+        client = gdata.contacts.client.ContactsClient(source=gdataSource)
+        auth2token.authorize(client)
+  
+        # Retrieve contacts
+        query = gdata.contacts.client.ContactsQuery()
+        query.max_results = 10000
+        feed = client.get_contacts(q=query)
+  
+        # Retrieve and create groups dictionary
+        groupIdToTitle = {}
+        groupsFeed = client.GetGroups(q = query)
+        for groupsEntry in groupsFeed.entry:
+            groupIdToTitle[groupsEntry.id.text] = groupsEntry.title.text
+  
+        for entry in feed.entry:
+     
+            # If contact has a name
+            # If contact has a phone number
+            # If contact is part of a group ("Other Contacts" autogroup is skipped this way)
+            if entry.name is not None and len(entry.phone_number) > 0 and len(entry.group_membership_info) > 0:
+     
+                # Clean up characters in contact name; replace all non-alphanumerics with spaces
+                fullName = entry.name.full_name.text
+                fullName = rx.sub(' ', fullName).strip()
+     
+                for rawPhoneNumber in entry.phone_number:
+                     
+                    # Remove non-numeric characters from the phone number
+                    phoneNumber = re.sub("[^0-9]", "", rawPhoneNumber.text)
+     
+                    # Remove country code from the phone number
+                    if countryCode != "" and phoneNumber.startswith(countryCode):
+                        phoneNumber = phoneNumber[len(countryCode):]
+     
+                    # Remove international dialing code from the phone number
+                    if internationalDialingCode != "" and phoneNumber.startswith(internationalDialingCode):
+                        phoneNumber = phoneNumber[len(internationalDialingCode):]
+  
+                    # Add wildcard prefix so that calling numbers with or without country code are matched
+                    # e.g. 1-555-555-5555 calling in, but wouldn't match 555-555-5555
+                    phoneNumber = "*"+phoneNumber
+  
+                    # Whitelist or Blacklist?
+                    groupName = "Whitelist"
+                    for groupId in entry.group_membership_info:
+                        if groupIdToTitle[groupId.href] == "Blacklist":
+                            groupName = "Blacklist"
+  
+                    # Save contact for later write
+                    googleContactsDict[phoneNumber] = (fullName, groupName)
+  
+    googleContacts = []
+    for phoneNumber, (fullName, groupName) in googleContactsDict.items():
+        googleContacts.append((fullName, phoneNumber, groupName))
+    googleContacts = tuple(googleContacts)
+  
+    return googleContacts
+  
+def googleContactsToVoipMsCSV(googleContacts):
+  
+    csvFile = open(csvFileName, "w")
+    for fullName, phoneNumber, groupName in googleContacts:
+        line = ",\"%s\",%s\n" % (fullName, phoneNumber)
+        csvFile.write(line)
+    csvFile.close()
+  
+def deleteAllVoipMsCallerIDFiltering():
+  
+    # Get all the Caller ID Filtering IDs to delete
+    payload = {"method" : "getCallerIDFiltering"}
+    payload.update(voipMsApiPayload)
+    result = requests.get(voipMsRestUrl, params=payload).json()
+    resultErrorStatus(result, payload)
+  
+    voipMsFilteringIDs = []
+    if "filtering" in result:
+        for filteringResult in result["filtering"]:
+            voipMsFilteringIDs.append(filteringResult["filtering"])
+  
+    # Delete all the Caller ID Filtering IDs
+    payload = {"filtering"  : None,
+               "method"     : "delCallerIDFiltering"}
+    payload.update(voipMsApiPayload)
+  
+    for filteringID in voipMsFilteringIDs:
+        payload["filtering"] = filteringID
+        result = requests.get(voipMsRestUrl, params=payload)
+  
+def setAnonymousCallerIDTimeCondition():
+  
+    payload = {"filter"     : None,
+               "callerid"   : "0",
+               "did"        : "all",
+               "routing"    : "sys:noservice",
+               "method"     : "setCallerIDFiltering",
+               "note"       : None}
+    payload.update(voipMsApiPayload)
+    result = requests.get(voipMsRestUrl, params=payload).json()
+    resultErrorStatus(result, payload)
+  
+def googleContactsToVoipMsCallerIDFiltering(googleContacts):
+  
+    payload = {"filter"               : None,
+               "callerid"             : None,
+               "did"                  : None,
+               "routing"              : None,
+               "method"               : "setCallerIDFiltering",
+               "failover_unreachable" : None,
+               "failover_busy"        : None,
+               "failover_noanswer"    : None,
+               "note"                 : None}
+    payload.update(voipMsApiPayload)
+  
+    # Create Blacklist Caller ID filtering for ALL DIDs
+    payload["did"] = "all"
+    payload["routing"] = "sys:noservice"
+    for fullName, phoneNumber, groupName in googleContacts:
+        if groupName == "Blacklist":
+            payload["callerid"] = phoneNumber
+            payload["note"] = fullName
+            result = requests.get(voipMsRestUrl, params=payload).json()
+            resultErrorStatus(result, payload)
+  
+    # Create Whitelist Caller ID filtering
+    for did, didRouting, didHeaderName, didUnreachable, didBusy, didNoAnswer in voipMsDids:
+  
+        # Set unchanging parameters
+        payload["did"] = did
+        payload["routing"] = _getRouting(didRouting, didHeaderName)
+  
+        # Set failover
+        if didUnreachable != None:
+            failRouting, failHeaderName = didUnreachable
+            payload["failover_unreachable"] = _getRouting(failRouting, failHeaderName)
+        if didBusy != None:
+            failRouting, failHeaderName = didBusy
+            payload["failover_busy"] = _getRouting(failRouting, failHeaderName)
+        if didNoAnswer != None:
+            failRouting, failHeaderName = didNoAnswer
+            payload["failover_noanswer"] = _getRouting(failRouting, failHeaderName)
+  
+        for fullName, phoneNumber, groupName in googleContacts:
+            if groupName != "Blacklist":
+                payload["callerid"] = phoneNumber
+                payload["note"] = fullName
+                result = requests.get(voipMsRestUrl, params=payload).json()
+                resultErrorStatus(result, payload)
+  
+def _getRouting(routing, headerName):
+  
+    # Set routing
+    if routing == "timecondition":
+        routingID = _getTimeConditionID(headerName)
+        routingResult = "tc:" + routingID
+    elif routing == "ring_group":
+        routingID = _getRingGroupID(headerName)
+        routingResult = "grp:" + routingID
+    elif routing == "forwarding":
+        routingID = _getForwardingID(headerName)
+        routingResult = "fwd:" + routingID
+    elif routing == "account":
+        routingID = headerName
+        routingResult = "account:" + routingID
+    else:
+        print >> sys.stderr, routing, "routing not supported"
+        sys.exit(1)
+  
+    return routingResult
+  
+def _getTimeConditionID(didHeaderName):
+  
+    payload = {"method" : "getTimeConditions"}
+    payload.update(voipMsApiPayload)
+    result = requests.get(voipMsRestUrl, params=payload).json()
+    resultErrorStatus(result, payload)
+  
+    for timeConditionResult in result["timecondition"]:
+        if timeConditionResult["name"] == didHeaderName:
+            whitelistTimeConditionID = timeConditionResult["timecondition"]
+  
+    return whitelistTimeConditionID
+  
+def _getRingGroupID(didHeaderName):
+  
+    payload = {"method" : "getRingGroups"}
+    payload.update(voipMsApiPayload)
+    result = requests.get(voipMsRestUrl, params=payload).json()
+    resultErrorStatus(result, payload)
+  
+    for ringGroupsResult in result["ring_groups"]:
+        if ringGroupsResult["name"] == didHeaderName:
+            whitelistRingGroupID = ringGroupsResult["ring_group"]
+  
+    return whitelistRingGroupID
+  
+def _getForwardingID(didHeaderName):
+  
+    payload = {"method" : "getForwardings"}
+    payload.update(voipMsApiPayload)
+    result = requests.get(voipMsRestUrl, params=payload).json()
+    resultErrorStatus(result, payload)
+  
+    for ringGroupsResult in result["forwardings"]:
+        if ringGroupsResult["phone_number"] == didHeaderName:
+            whitelistForwardingID = ringGroupsResult["forwarding"]
+  
+    return whitelistForwardingID
+  
+def resultErrorStatus(result, payload):
+    if result["status"] != "success":
+        print >> sys.stderr, result
+        print >> sys.stderr, payload
+        print >> sys.stderr, "-------"
+  
+if __name__ == "__main__":
+    Drive()
