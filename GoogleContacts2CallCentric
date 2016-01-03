@@ -1,7 +1,7 @@
 #!/usr/bin/env python
   
 # Author: Tashfeen Bhimdi
-# Version: 2014-07-28
+# Version: 2015-07-05
 #
 # Modification of code by John Baab (googlecontacts.py v0.1)
 # http://pbxinaflash.com/community/index.php?threads/google-contacts-to-asterisk-phonebook.10943/
@@ -12,8 +12,13 @@
 #        -Contacts are pulled from Google
 #        -Pulled contacts are stored in a CSV file
 #
-# Debian:
+# Ubuntu:
 # apt-get install python-gdata
+# apt-get install python-oauth2client
+# 
+# Windows (Python Portable 2.7):
+# App\Scripts\easy_install.exe gdata
+# App\Scripts\easy_install.exe oauth2client
 #
 # License:
 #
@@ -34,40 +39,85 @@
 # On Debian & Ubuntu systems, a complete copy of the GPL can be found under
 # /usr/share/common-licenses/GPL-3, or (at your option) any later version
   
+import os
 import re
   
+import oauth2client.client
 import gdata.contacts.client
+import gdata.gauth
+  
+# GLOBAL VARS
+  
+# Change if modifying script
+gdataSource = "googlecontacts_callcentric_csv"
+  
+# From https://developers.google.com/api-client-library/python/auth/service-accounts
+  
+# Go here: https://console.developers.google.com/
+# Under APIs & Auth -> APIs: Add Contacts API
+# Under APIs & Auth -> Credentials: "Create new Client ID"
+# "Service account", "P12 Key"
+# Copy P12 key into credentials subdirectory
+# (I used the same P12 Key for all accounts)
+  
+# If using Google Apps, also do this:
+# Go here: http://admin.google.com/
+# Security -> More Controls -> Advanced Settings -> Authentication -> Manage API client access
+# Client name: "Client ID" from above
+# Scope: https://www.googleapis.com/auth/contacts.readonly
+# Authorize
+# (I used the same Client ID for all accounts)
+  
+# For single account:
+# googleUserAccounts = (("person1@gmail.com", "xxxx.p12", "yyyy@zzzz"),)
+  
+googleUserAccounts = (("person1@gmail.com", "xxxx.p12", "yyyy@zzzz"),
+                      ("person2@gmail.com", "xxxx.p12", "yyyy@zzzz"))
+  
+# Change if not in the US
+# Prefixes are removed from contact numbers before inserted into MySQL database
+# Use "" if you don't want a prefix removed
+countryCode = "1"
+internationalDialingCode = "011"
+  
+# Output file name
+csvFileName = "callcentric_whitelist.csv"
   
 def Drive():
   
-    # Use "" if you don't want a prefix removed
-    countryCode = ""
-    internationalDialingCode = "011"
+    # Get all contacts
+    googleContacts = getGoogleContacts()
   
-    # Google login info
-    # PLEASE use app specific passwords
-    # If only using one account, make sure variable is stored in this format:
-    # googleUserAccounts = (("name@example.com", "mypassword"))
-    googleUserAccounts = (("name1@example.com", "pw1"),
-                          ("name2@example.com", "pw2"))
+    # Write to file
+    csvFile = open(csvFileName, "w")
+    for fullName, phoneNumber in googleContacts:
+        line = ",\"%s\",%s,Whitelist\n" % (fullName, phoneNumber)
+        csvFile.write(line)
+    csvFile.close()
   
-    csvFileName = "callcentric_whitelist.csv"
-  
-    ################################
+def getGoogleContacts():
   
     rx = re.compile('\W+')
-    allGoogleContacts = []
-    for email, password in googleUserAccounts:
+    googleContacts = []
+    for userEmail, p12Filename, clientEmail in googleUserAccounts:
   
         # Login to Google
-        gd_client = gdata.contacts.client.ContactsClient(source='googlecontacts_callcentric_csv')
-        gd_client.ClientLogin(email, password, gd_client.source)
-     
+        scope = "https://www.googleapis.com/auth/contacts.readonly"
+        with open(os.path.join("./credentials", p12Filename)) as f:
+            private_key = f.read()
+        credentials = oauth2client.client.SignedJwtAssertionCredentials(service_account_name = clientEmail,
+                                                                        private_key = private_key,
+                                                                        scope = scope,
+                                                                        sub = userEmail)
+        auth2token = gdata.gauth.OAuth2TokenFromCredentials(credentials)
+        client = gdata.contacts.client.ContactsClient(source=gdataSource)
+        auth2token.authorize(client)
+  
         # Retrieve contacts
         query = gdata.contacts.client.ContactsQuery()
         query.max_results = 10000
-        feed = gd_client.GetContacts(q = query)
-     
+        feed = client.get_contacts(q=query)
+  
         for entry in feed.entry:
      
             # If contact has a name
@@ -93,17 +143,12 @@ def Drive():
                         phoneNumber = phoneNumber[len(internationalDialingCode):]
      
                     # Save contact for later insert
-                    allGoogleContacts.append((fullName, phoneNumber))
+                    googleContacts.append((fullName, phoneNumber))
   
     # Remove NAME+NUMBER duplicates (if an account has duplicates or multiple accounts have the same contact)
-    allGoogleContacts = tuple(set(allGoogleContacts))
+    googleContacts = tuple(set(googleContacts))
   
-    csvFile = open(csvFileName, "w")
-    for csvFullName, csvPhoneNumber in allGoogleContacts:
-        line = ",\"%s\",%s,Whitelist\n" % (csvFullName, csvPhoneNumber)
-        csvFile.write(line)
-     
-    csvFile.close()
+    return googleContacts
   
 if __name__ == "__main__":
     Drive()
